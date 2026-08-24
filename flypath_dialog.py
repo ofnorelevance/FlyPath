@@ -68,12 +68,14 @@ from qgis.core import (
     Qgis,
     QgsProject,
     QgsWkbTypes,
+    QgsRasterLayer,
     QgsVectorLayer,
     QgsFeature,
     QgsGeometry,
     QgsPointXY,
     QgsLineSymbol,
     QgsMarkerSymbol,
+    QgsMessageLog,
     QgsFillSymbol,
     QgsRuleBasedRenderer,
     QgsPalLayerSettings,
@@ -781,6 +783,12 @@ class FlyPathDialog(QWidget):
             'For multi-feature layers a Feature selector will appear below.')
         form.addRow('Layer', self.layerCombo)
 
+        self.dtmCombo = QComboBox()
+        self._tip(self.dtmCombo,
+            'Optional raster layer with ground elevations in band 1'
+            'to aid in keeping constant distance to ground calculations.')
+        form.addRow('DTM', self.dtmCombo)
+
         self.featureCombo = QComboBox()
         self.featureCombo.setVisible(False)
         self._tip(self.featureCombo,
@@ -1359,6 +1367,7 @@ class FlyPathDialog(QWidget):
             'Continue mission',
         ])
         self._refresh_layer_combo()
+        self._refresh_dtm_combo()
 
     def _refresh_layer_combo(self, _=None):
         previously_selected = self.layerCombo.currentData()
@@ -1376,12 +1385,27 @@ class FlyPathDialog(QWidget):
         self.layerCombo.setCurrentIndex(idx if idx >= 0 else 0)
         self.layerCombo.blockSignals(False)
 
+    def _refresh_dtm_combo(self, _=None):
+        previously_selected = self.dtmCombo.currentData()
+        self.dtmCombo.blockSignals(True)
+        self.dtmCombo.clear()
+        self.dtmCombo.addItem('— none —', None)
+        for layer in filter(lambda x: isinstance(x, QgsRasterLayer), QgsProject.instance().mapLayers().values()):
+            self.dtmCombo.addItem(layer.name(), layer.id())
+       # Restore previous selection if the dtm still exists
+        idx = self.dtmCombo.findData(previously_selected)
+        self.dtmCombo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.dtmCombo.blockSignals(False)
+
     # ── Signal wiring ─────────────────────────────────────────────────────
 
     def _connect_signals(self):
         # Refresh layer combo when layers are added/removed
         QgsProject.instance().layersAdded.connect(self._refresh_layer_combo)
         QgsProject.instance().layersRemoved.connect(self._refresh_layer_combo)
+
+        QgsProject.instance().layersAdded.connect(self._refresh_dtm_combo)
+        QgsProject.instance().layersRemoved.connect(self._refresh_dtm_combo)
 
         self.missionTypeCombo.currentIndexChanged.connect(self._on_mission_type_changed)
         self.captureSemiRadio.toggled.connect(self._on_mission_type_changed)
@@ -2226,6 +2250,7 @@ class FlyPathDialog(QWidget):
                     waypoints.extend(dp)
             if not full:
                 waypoints = turn_pts
+            waypoints = self._fill_waypoint_gl(waypoints)
         except Exception:
             turn_pts = waypoints = None
 
@@ -2248,6 +2273,7 @@ class FlyPathDialog(QWidget):
             per_photo  = max(_HALT_S, d.camera.min_shoot_interval_s)
             flight_min = (dist_m / speed + n_photos * per_photo) / 60.0 if speed > 0 else 0.0
         else:
+            QgsMessageLog.logMessage(f'1 {dist_m} / {actual_spacing}')
             n_photos   = max(0, int(dist_m / actual_spacing))
             flight_min = dist_m / (speed * 60.0) if speed > 0 else 0.0
         batteries  = math.ceil(flight_min / usable_min) if flight_min > 0 else 0
@@ -2316,6 +2342,29 @@ class FlyPathDialog(QWidget):
         super().hideEvent(event)
         self._hide_hud()
 
+    def _fill_waypoint_gl (self, waypoints):
+        """ If a DTM layer is selected, annotate the waypoint with a height taken
+        from it, otherwise set it at 0. This will be used to facilitate setting the
+        waypoint heights follow the ground in relative terms. """
+        dtm_dp = None
+        if self.dtmCombo.currentIndex() > 0:
+            dtmlayer = QgsProject.instance().mapLayer(self.dtmCombo.currentData())
+            QgsMessageLog.logMessage(f"2 {dtmlayer}")
+            if not dtmlayer:
+                return
+            wgs84 = QgsCoordinateReferenceSystem('EPSG:4326')
+            dtm_xform = QgsCoordinateTransform(wgs84, dtmlayer.dataProvider().crs(), QgsProject.instance())
+            dtm_dp = dtmlayer.dataProvider()
+            QgsMessageLog.logMessage(f"3 {dtm_xform}")
+
+        if dtm_dp is not None:
+            waypoints = [(x,y,dtm_dp.sample(dtm_xform.transform(QgsPointXY(x,y)),1)[0]) for x,y in waypoints]
+        else:
+            waypoints = [(x,y,0.) for x,y in waypoints]
+        QgsMessageLog.logMessage(f"4 {waypoints[0]}")
+        return waypoints
+
+
     # ── Map preview ───────────────────────────────────────────────────────
 
     def _on_preview(self):
@@ -2376,7 +2425,7 @@ class FlyPathDialog(QWidget):
                 continue
             feat = QgsFeature()
             feat.setGeometry(QgsGeometry.fromPolylineXY(
-                [QgsPointXY(lon, lat) for lon, lat in wps]
+                [QgsPointXY(lon, lat) for lon, lat, _ in wps]
             ))
             feat.setAttributes([m, m])
             feats.append(feat)
@@ -2387,7 +2436,7 @@ class FlyPathDialog(QWidget):
         """Create and register a rule-based Point layer for waypoint markers."""
         layer = QgsVectorLayer(
             'Point?crs=EPSG:4326&field=seq:integer&field=wp_type:string(10)'
-            '&field=mission:integer',
+            '&field=mission:integer&field=wp_dtm_z:double',
             'FlyPath — Waypoints', 'memory'
         )
         layer.setCustomProperty('flypath_internal', True)
@@ -2430,10 +2479,12 @@ class FlyPathDialog(QWidget):
         from 1 on its own and gets its own start and end marker."""
         dp = layer.dataProvider()
         dp.truncate()
+        QgsMessageLog.logMessage(f"5 {dp.crs()}")
+
         wp_feats = []
         for m, wps in enumerate(missions):
             last_idx = len(wps) - 1
-            for i, (lon, lat) in enumerate(wps):
+            for i, (lon, lat, gl) in enumerate(wps):
                 f = QgsFeature()
                 f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
                 if i == 0:
@@ -2442,7 +2493,7 @@ class FlyPathDialog(QWidget):
                     wp_type = 'end'
                 else:
                     wp_type = 'mid'
-                f.setAttributes([i + 1, wp_type, m])
+                f.setAttributes([i + 1, wp_type, m, gl])
                 wp_feats.append(f)
         dp.addFeatures(wp_feats)
         layer.triggerRepaint()
@@ -2658,7 +2709,7 @@ class FlyPathDialog(QWidget):
                 return QPointF(ox + (lon - minx) * s,
                                H - (oy + (lat - miny) * s))   # flip Y
 
-            pts = [to_px(lon, lat) for lon, lat in waypoints]
+            pts = [to_px(lon, lat) for lon, lat, _ in waypoints]
             pen = QPen(QColor('#2ECC71'))
             pen.setWidth(4)
             painter.setPen(pen)
@@ -3298,6 +3349,7 @@ class FlyPathDialog(QWidget):
             return
 
         missions = self._split_missions(waypoints)
+        QgsMessageLog.logMessage(f'8 {waypoints[0]}')
 
         if self.destCombo.currentData() == 'rc':
             # The RC replaces one mission slot, so send just the chosen part.
@@ -3400,6 +3452,7 @@ class FlyPathDialog(QWidget):
         written = []
         try:
             for path, wps, name in targets:
+                QgsMessageLog.logMessage(f'9 {wps[0]}')
                 self._write_mission_kmz(path, wps, name)
                 written.append(path)
         except Exception as exc:
@@ -3697,7 +3750,9 @@ class FlyPathDialog(QWidget):
             QgsProject.instance().removeMapLayer(lid)
         try:
             QgsProject.instance().layersAdded.disconnect(self._refresh_layer_combo)
+            QgsProject.instance().layersAdded.disconnect(self._refresh_dtm_combo)
             QgsProject.instance().layersRemoved.disconnect(self._refresh_layer_combo)
+            QgsProject.instance().layersRemoved.disconnect(self._refresh_dtm_combo)
         except (TypeError, RuntimeError):
             pass
         if self._thumb_dir:
@@ -3752,6 +3807,7 @@ class FlyPathDialog(QWidget):
                 self.speedSpin.value() * self.photoIntervalSpin.value(), 0.5
             )
         try:
+            
             waypoints = []
             for direction in self._grid_directions():
                 wps, shot_spacing_m = generate_flight_grid(
@@ -3766,6 +3822,7 @@ class FlyPathDialog(QWidget):
                     densify_spacing=densify,
                 )
                 waypoints.extend(wps)
+                waypoints = self._fill_waypoint_gl(waypoints)
         except ValueError as exc:
             QMessageBox.warning(self, 'Cannot Generate Grid', str(exc))
             return None
